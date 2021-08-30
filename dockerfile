@@ -1,0 +1,1 @@
+FROM juliantotzek/verademo1-tomcat

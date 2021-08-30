@@ -1,0 +1,129 @@
+stages:
+    - Build
+    - Security_Scan
+    - Deploy_Run
+    - Dynamic_Analysis
+
+Compile Application:
+    image: maven:3.6.0-jdk-8
+    stage: Build
+    script:
+      - mvn clean package
+    artifacts:
+      name: verademo_julian_10_build
+      paths:
+        - target/
+      expire_in: 5 week
+    cache:
+      paths:
+        - target/
+        - .m2/repository
+
+Build Docker Image:
+    image: docker:19.03.8-dind 
+    stage: Build
+    services:
+        - docker:19.03.8-dind
+    before_script:
+        - docker info
+    script:
+        - docker build -t verademo .
+
+
+Software Composition Analysis App 3rd party:
+    image: maven:3.6.0-jdk-8
+    stage: Security_Scan
+    script:
+        - curl -sSL https://download.sourceclear.com/ci.sh | bash
+    artifacts:
+        paths:
+            - results.json
+        when: always
+        name: "veracode-SCA-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+    allow_failure: false
+
+Software Composition Analysis Docker 3rd party:
+    image: juliantotzek/dockercli
+    stage: Security_Scan
+    services:
+        - docker:dind
+    variables:
+        DOCKER_HOST: tcp://docker:2375
+    before_script:
+        - docker pull juliantotzek/verademo1-tomcat
+    
+    script:
+        - curl -sSL https://download.sourceclear.com/ci.sh | bash -s scan --image juliantotzek/verademo1-tomcat
+    artifacts:
+        paths:
+            - results.json
+        when: always
+        name: "veracode-SCA-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+    allow_failure: false
+
+Pipeline Scan Staic Analysis:
+    image: openjdk:11-jre
+    stage: Security_Scan
+    only:
+        - development
+    before_script:
+        - curl -sSO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+        - unzip pipeline-scan-LATEST.zip
+    script:
+        - java -jar pipeline-scan.jar -vid ${VERACODE_API_ID} -vkey ${VERACODE_API_KEY} --file target/verademo.war -jf results.json --gl_vulnerability_generation true
+    artifacts:
+        paths:
+            - results.json
+            - veracode_gitlab_vulnerabilities.json
+        when: always
+        name: "veracode-pipeline-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+    allow_failure: false
+    
+Sandbox Scan Static Analysis:
+    image: openjdk:11-jre
+    stage: Security_Scan
+    only:
+        - release
+    before_script:
+        - wget -q -O veracode-wrapper.jar https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/${VERACODE_WRAPPER_VERSION}/vosp-api-wrappers-java-${VERACODE_WRAPPER_VERSION}.jar
+    script:
+        - java -jar veracode-wrapper.jar -vid ${TEAM_ANALYSISCENTER_ID} -vkey ${TEAM_ANALYSISCENTER_KEY}
+          -action UploadAndScan -appname "Verademo" -createprofile true -autoscan true -sandboxname "gitlab-release"
+          -filepath ./target/verademo.war -version "Job ${CI_JOB_ID} in pipeline ${CI_PIPELINE_ID}"
+          -scantimeout 15
+    allow_failure: true
+    
+Policy Scan Static Analysis:
+    image: openjdk:11-jre
+    stage: Security_Scan
+    only:
+        - schedules
+        - master
+    before_script:
+            - wget -q -O veracode-wrapper.jar https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/${VERACODE_WRAPPER_VERSION}/vosp-api-wrappers-java-${VERACODE_WRAPPER_VERSION}.jar
+    script:
+        - java -jar veracode-wrapper.jar -vid ${TEAM_ANALYSISCENTER_ID} -vkey ${TEAM_ANALYSISCENTER_KEY}
+          -action UploadAndScan -appname "Verademo" -createprofile false -autoscan true
+          -filepath ./target/verademo.war -version "Job ${CI_JOB_ID} in pipeline ${CI_PIPELINE_ID}"
+          -scantimeout 15
+
+Docker Start in Staging:
+    image: docker:19.03.8-dind 
+    stage: Deploy_Run
+    only:
+        - development
+        - release
+    services:
+         - docker:19.03.8-dind
+    before_script:
+            - docker info
+    script:
+        - docker run verademo
+
+Dynamic Analysis in Staging:
+    stage: Dynamic_Analysis
+    only:
+        - development
+        - release
+    script:
+        - http --auth-type veracode_hmac PUT https://api.veracode.com//was/configservice/v1/scan_occurrences/358303b78b3670b42083a410c770323d?action=RESUBMIT

@@ -1,0 +1,242 @@
+stages:
+    - Build
+    - Security_Scan
+    - Scan_Reporting
+    - Housekeeping
+    - Deploy_Run
+    - Dynamic_Analysis
+
+Compile Application:
+    image: maven:3.6.0-jdk-8
+    stage: Build
+    script:
+      - mvn clean package
+    artifacts:
+      name: verademo_julian_10_build
+      paths:
+        - target/
+      expire_in: 5 week
+    cache:
+      paths:
+        - target/
+        - .m2/repository
+
+Build Docker Image:
+    image: docker:19.03.8-dind 
+    stage: Build
+    services:
+        - docker:19.03.8-dind
+    before_script:
+        - docker info
+    script:
+        - docker pull juliantotzek/verademo1-tomcat
+
+
+Software Composition Analysis App 3rd party:
+    image: maven:3.6.0-jdk-8
+    stage: Security_Scan
+    before_script:
+        - curl -sL https://deb.nodesource.com/setup_12.x | bash -
+        - apt-get update && apt-get -y install nodejs
+        - npm install axios
+        - npm install mathjs
+
+    script:
+        - curl -sSL https://download.sourceclear.com/ci.sh | bash -s scan . --update-advisor --json scaResults.json --allow-dirty --scan-collectors maven 2>&1 | tee sca_output.txt
+    after_script:
+        - nodejs ./dependencies.js ${PRIVATE_TOKEN} true 17140954
+    artifacts:
+        reports:
+            dependency_scanning: output-sca-vulnerabilites.json
+        paths:
+            - sca_output.txt
+            - output-sca-vulnerabilites.json
+        when: always
+        name: "veracode-SCA-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+    allow_failure: true
+
+
+Software Composition Analysis Docker 3rd party:
+    image: juliantotzek/dockercli
+    stage: Security_Scan
+    services:
+        - docker:dind
+    variables:
+        DOCKER_HOST: tcp://docker:2375
+    before_script:
+        - curl -sL https://deb.nodesource.com/setup_12.x | bash -
+        - apt-get update && apt-get -y install nodejs
+        - npm install axios
+        - npm install mathjs
+        - docker pull juliantotzek/verademo1-tomcat
+
+    script:
+        - curl -sSL https://download.sourceclear.com/ci.sh | bash -s scan --image juliantotzek/verademo1-tomcat --json scaResults.json 2>&1 | tee sca_docker_output.txt
+    after_script:
+        - nodejs ./dependencies.js
+    artifacts:
+        reports:
+            dependency_scanning: output-sca-vulnerabilites.json
+        paths:
+            - sca_docker_output.txt
+        when: always
+        name: "veracode-SCA-DOCKER-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+    allow_failure: false
+
+
+Pipeline Scan Staic Analysis:
+    image: veracode/pipeline-scan:latest
+    stage: Security_Scan
+    only:
+        - development
+    script:
+        - java -jar /opt/veracode/pipeline-scan.jar -vid ${VERACODE_API_ID} -vkey ${VERACODE_API_KEY} --request_policy "VeraDemo Policy" 2>&1 | tee pipeline_scan_policy_output.txt
+        - java -jar /opt/veracode/pipeline-scan.jar -vid ${VERACODE_API_ID} -vkey ${VERACODE_API_KEY} --file target/verademo.war --issue_details true --gl_issue_generation true --gl_vulnerability_generation true --policy_file VeraDemo_Policy.json -bf pipeline-basline.json -fjf filtered_results.json 2>&1 | tee pipeline_scan_text_output.txt
+    artifacts:
+        reports: 
+            sast: veracode_gitlab_vulnerabilities.json
+        paths:
+            - results.json
+            - filtered_results.json
+            - pipeline_scan_text_output.txt
+            - pipeline_scan_policy_output.pipeline_scan_text_output
+            - veracode_gitlab_vulnerabilities.json
+        when: always
+        name: "veracode-pipeline-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+    allow_failure: true
+    
+Sandbox Scan Static Analysis:
+    image: veracode/api-wrapper-java
+    stage: Security_Scan
+    only:
+        - release
+    script:
+        - java -jar /opt/veracode/api-wrapper.jar -vid ${TEAM_ANALYSISCENTER_ID} -vkey ${TEAM_ANALYSISCENTER_KEY}
+          -action UploadAndScan -appname "Verademo" -createprofile true -autoscan true -sandboxname "gitlab-release" -createsandbox true
+          -filepath ./target/verademo.war -version "Job ${CI_JOB_ID} in pipeline ${CI_PIPELINE_ID}" -scantimeout 15 2>&1 | tee sandbox_scan_output.txt
+    artifacts:
+        paths:
+            - sandbox_scan_output.txt
+        when: always
+        name: "veracode-SANDBOX-SCAN-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+    allow_failure: true
+
+Policy Scan Static Analysis:
+    image: veracode/api-wrapper-java
+    stage: Security_Scan
+    only:
+        - schedules
+        - master
+    script:
+        - java -jar /opt/veracode/api-wrapper.jar -vid ${TEAM_ANALYSISCENTER_ID} -vkey ${TEAM_ANALYSISCENTER_KEY}
+          -action UploadAndScan -appname "Verademo" -createprofile false -autoscan true
+          -filepath ./target/verademo.war -version "Job ${CI_JOB_ID} in pipeline ${CI_PIPELINE_ID}" 
+          -scantimeout 15 2>&1 | tee policy_scan_output.txt
+    artifacts:
+        paths:
+            - policy_scan_output.txt
+        when: always
+        name: "veracode-POLICY-SCAN-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+    allow_failure: true
+
+
+Generate static analysis report and issues - Sandbox Scan:
+    image: node:latest
+    stage: Scan_Reporting
+    only:
+        - release
+    before_script:
+        - npm ci
+    script:
+        - npm run results-import scan_type=sandbox profile_name=Verademo sandbox_name=gitlab-release gitlab_token=${PRIVATE_TOKEN} gitlab_project=17140954 create_issue=true  
+    artifacts:
+        reports:
+            sast: output-sast-vulnerabilites.json
+        paths: 
+            - output-sast-vulnerabilites.json
+        when: always
+        name: "veracode-POLICY-SCAN-RESULTS-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+
+Generate static analysis report and issues - Policy Scan:
+    image: node:latest
+    stage: Scan_Reporting
+    only:
+        - schedules
+        - master
+    before_script:
+        - npm ci
+    script:
+        - npm run results-import scan_type=policy profile_name=Verademo gitlab_token=${PRIVATE_TOKEN} gitlab_project=17140954 create_issue=true  
+    artifacts:
+        reports:
+            sast: output-sast-vulnerabilites.json
+        paths: 
+            - output-sast-vulnerabilites.json
+        when: always
+        name: "veracode-POLICY-SCAN-RESULTS-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+
+Pipeline Scan create new baseline file:
+    image: veracode/pipeline-scan:latest
+    stage: Scan_Reporting
+    only:
+        - schedules
+        - master
+    script:
+        - java -jar /opt/veracode/pipeline-scan.jar -vid ${VERACODE_API_ID} -vkey ${VERACODE_API_KEY} --file target/verademo.war -jf pipeline-basline.json 2>&1 | tee pipeline_baseline_file_output.txt
+    artifacts:
+        paths:
+            - pipeline-basline.json
+            - pipeline_baseline_file_output.txt
+        when: always
+        name: "veracode-pipeline-baseline-$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+    allow_failure: true
+
+Pipeline Scan baseline file commit:
+    stage: Housekeeping
+    when: on_success
+    only:
+        - schedules
+        - master
+    before_script:
+        - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+        - eval $(ssh-agent -s)
+        - ssh-add <(echo "$GIT_SSH_PRIV_KEY")
+        - git config --global user.name "${GITLAB_USER_NAME}"
+        - git config --global user.email "${GITLAB_USER_EMAIL}"
+        - mkdir -p ~/.ssh
+        - cat gitlab-known-hosts >> ~/.ssh/known_hosts
+    script:
+        - git --help
+        - git add -f pipeline-basline.json
+        - git commit -m "Pipeline Baseline from $CI_COMMIT_SHORT_SHA" || echo "No changes, nothing to commit!"
+        - git remote rm origin && git remote add origin git@gitlab.com:$CI_PROJECT_PATH.git
+        - git push origin HEAD:development
+    allow_failure: true
+
+Docker Start:
+    image: docker:19.03.8-dind 
+    stage: Deploy_Run
+    only:
+        - development
+        - release
+        - master
+    services:
+         - docker:19.03.8-dind
+    before_script:
+            - docker info
+    script:
+        - docker pull juliantotzek/verademo1-tomcat
+        - docker image history juliantotzek/verademo1-tomcat
+
+Dynamic Analysis:
+    image: veracode/api-signing
+    stage: Dynamic_Analysis
+    only:
+        - development
+        - release
+        - master
+    before_script:
+        - export VERACODE_API_KEY_ID=${VERACODE_API_ID}
+          export VERACODE_API_KEY_SECRET=${VERACODE_API_KEY}
+    script:
+        - http --auth-type veracode_hmac PUT https://api.veracode.com/was/configservice/v1/analyses/4e1ef3bc1b061f9e4331b0af10dc8138?method=PATCH < da_scan_update.json
